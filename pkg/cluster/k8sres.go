@@ -20,6 +20,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	"golang.org/x/exp/maps"
+	batchv1 "k8s.io/api/batch/v1"
+	"k8s.io/apimachinery/pkg/labels"
+
 	acidv1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
 	"github.com/zalando/postgres-operator/pkg/spec"
 	"github.com/zalando/postgres-operator/pkg/util"
@@ -28,9 +32,6 @@ import (
 	"github.com/zalando/postgres-operator/pkg/util/k8sutil"
 	"github.com/zalando/postgres-operator/pkg/util/patroni"
 	"github.com/zalando/postgres-operator/pkg/util/retryutil"
-	"golang.org/x/exp/maps"
-	batchv1 "k8s.io/api/batch/v1"
-	"k8s.io/apimachinery/pkg/labels"
 )
 
 const (
@@ -64,9 +65,8 @@ type patroniDCS struct {
 }
 
 type pgBootstrap struct {
-	Initdb []interface{}     `json:"initdb"`
-	Users  map[string]pgUser `json:"users"`
-	DCS    patroniDCS        `json:"dcs,omitempty"`
+	Initdb []interface{} `json:"initdb"`
+	DCS    patroniDCS    `json:"dcs,omitempty"`
 }
 
 type spiloConfiguration struct {
@@ -267,6 +267,19 @@ func fillResourceList(spec acidv1.ResourceDescription, defaults acidv1.ResourceD
 		}
 	}
 
+	if spec.HugePages2Mi != nil {
+		requests[v1.ResourceHugePagesPrefix+"2Mi"], err = resource.ParseQuantity(*spec.HugePages2Mi)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse hugepages-2Mi quantity: %v", err)
+		}
+	}
+	if spec.HugePages1Gi != nil {
+		requests[v1.ResourceHugePagesPrefix+"1Gi"], err = resource.ParseQuantity(*spec.HugePages1Gi)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse hugepages-1Gi quantity: %v", err)
+		}
+	}
+
 	return requests, nil
 }
 
@@ -428,13 +441,6 @@ PatroniInitDBParams:
 	// relevant section in the manifest.
 	if len(patroni.PgHba) > 0 {
 		config.PgLocalConfiguration[patroniPGHBAConfParameterName] = patroni.PgHba
-	}
-
-	config.Bootstrap.Users = map[string]pgUser{
-		opConfig.PamRoleName: {
-			Password: "",
-			Options:  []string{constants.RoleFlagCreateDB, constants.RoleFlagNoLogin},
-		},
 	}
 
 	res, err := json.Marshal(config)
@@ -1143,6 +1149,37 @@ func (c *Cluster) getPodEnvironmentSecretVariables() ([]v1.EnvVar, error) {
 
 	sort.Slice(secretPodEnvVarsList, func(i, j int) bool { return secretPodEnvVarsList[i].Name < secretPodEnvVarsList[j].Name })
 	return secretPodEnvVarsList, nil
+}
+
+// Return list of variables the cronjob received from the configured Secret
+func (c *Cluster) getCronjobEnvironmentSecretVariables() ([]v1.EnvVar, error) {
+	secretCronjobEnvVarsList := make([]v1.EnvVar, 0)
+
+	if c.OpConfig.LogicalBackupCronjobEnvironmentSecret == "" {
+		return secretCronjobEnvVarsList, nil
+	}
+
+	secret, err := c.KubeClient.Secrets(c.Namespace).Get(
+		context.TODO(),
+		c.OpConfig.LogicalBackupCronjobEnvironmentSecret,
+		metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("could not read Secret CronjobEnvironmentSecretName: %v", err)
+	}
+
+	for k := range secret.Data {
+		secretCronjobEnvVarsList = append(secretCronjobEnvVarsList,
+			v1.EnvVar{Name: k, ValueFrom: &v1.EnvVarSource{
+				SecretKeyRef: &v1.SecretKeySelector{
+					LocalObjectReference: v1.LocalObjectReference{
+						Name: c.OpConfig.LogicalBackupCronjobEnvironmentSecret,
+					},
+					Key: k,
+				},
+			}})
+	}
+
+	return secretCronjobEnvVarsList, nil
 }
 
 func getSidecarContainer(sidecar acidv1.Sidecar, index int, resources *v1.ResourceRequirements) *v1.Container {
@@ -2127,10 +2164,17 @@ func (c *Cluster) generateStandbyEnvironment(description *acidv1.StandbyDescript
 func (c *Cluster) generatePodDisruptionBudget() *policyv1.PodDisruptionBudget {
 	minAvailable := intstr.FromInt(1)
 	pdbEnabled := c.OpConfig.EnablePodDisruptionBudget
+	pdbMasterLabelSelector := c.OpConfig.PDBMasterLabelSelector
 
 	// if PodDisruptionBudget is disabled or if there are no DB pods, set the budget to 0.
 	if (pdbEnabled != nil && !(*pdbEnabled)) || c.Spec.NumberOfInstances <= 0 {
 		minAvailable = intstr.FromInt(0)
+	}
+
+	// define label selector and add the master role selector if enabled
+	labels := c.labelsSet(false)
+	if pdbMasterLabelSelector == nil || *c.OpConfig.PDBMasterLabelSelector {
+		labels[c.OpConfig.PodRoleLabel] = string(Master)
 	}
 
 	return &policyv1.PodDisruptionBudget{
@@ -2143,7 +2187,7 @@ func (c *Cluster) generatePodDisruptionBudget() *policyv1.PodDisruptionBudget {
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			MinAvailable: &minAvailable,
 			Selector: &metav1.LabelSelector{
-				MatchLabels: c.roleLabelsSet(false, Master),
+				MatchLabels: labels,
 			},
 		},
 	}
@@ -2180,7 +2224,13 @@ func (c *Cluster) generateLogicalBackupJob() (*batchv1.CronJob, error) {
 		return nil, fmt.Errorf("could not generate resource requirements for logical backup pods: %v", err)
 	}
 
+	secretEnvVarsList, err := c.getCronjobEnvironmentSecretVariables()
+	if err != nil {
+		return nil, err
+	}
+
 	envVars := c.generateLogicalBackupPodEnvVars()
+	envVars = append(envVars, secretEnvVarsList...)
 	logicalBackupContainer := generateContainer(
 		logicalBackupContainerName,
 		&c.OpConfig.LogicalBackup.LogicalBackupDockerImage,
@@ -2192,10 +2242,11 @@ func (c *Cluster) generateLogicalBackupJob() (*batchv1.CronJob, error) {
 		nil,
 	)
 
-	labels := map[string]string{
-		c.OpConfig.ClusterNameLabel: c.Name,
-		"application":               "spilo-logical-backup",
+	logicalBackupJobLabel := map[string]string{
+		"application": "spilo-logical-backup",
 	}
+
+	labels := labels.Merge(c.labelsSet(true), logicalBackupJobLabel)
 
 	nodeAffinity := c.nodeAffinity(c.OpConfig.NodeReadinessLabel, nil)
 	podAffinity := podAffinity(
@@ -2212,7 +2263,7 @@ func (c *Cluster) generateLogicalBackupJob() (*batchv1.CronJob, error) {
 	if podTemplate, err = c.generatePodTemplate(
 		c.Namespace,
 		labels,
-		annotations,
+		c.annotationsSet(annotations),
 		logicalBackupContainer,
 		[]v1.Container{},
 		[]v1.Container{},
