@@ -28,6 +28,7 @@ import (
 	"github.com/zalando/postgres-operator/pkg/util/users"
 	"github.com/zalando/postgres-operator/pkg/util/volumes"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -254,10 +255,21 @@ func (c *Cluster) Create() (err error) {
 	)
 
 	defer func() {
+		var (
+			pgUpdatedStatus *acidv1.Postgresql
+			errStatus       error
+		)
 		if err == nil {
-			c.KubeClient.SetPostgresCRDStatus(c.clusterName(), acidv1.ClusterStatusRunning) //TODO: are you sure it's running?
+			pgUpdatedStatus, errStatus = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), acidv1.ClusterStatusRunning) //TODO: are you sure it's running?
 		} else {
-			c.KubeClient.SetPostgresCRDStatus(c.clusterName(), acidv1.ClusterStatusAddFailed)
+			c.logger.Warningf("cluster created failed: %v", err)
+			pgUpdatedStatus, errStatus = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), acidv1.ClusterStatusAddFailed)
+		}
+		if errStatus != nil {
+			c.logger.Warningf("could not set cluster status: %v", errStatus)
+		}
+		if pgUpdatedStatus != nil {
+			c.setSpec(pgUpdatedStatus)
 		}
 	}()
 
@@ -427,8 +439,8 @@ func (c *Cluster) compareStatefulSetWith(statefulSet *appsv1.StatefulSet) *compa
 		reasons = append(reasons, "new statefulset's persistent volume claim retention policy do not match")
 	}
 
-	needsRollUpdate, reasons = c.compareContainers("initContainers", c.Statefulset.Spec.Template.Spec.InitContainers, statefulSet.Spec.Template.Spec.InitContainers, needsRollUpdate, reasons)
-	needsRollUpdate, reasons = c.compareContainers("containers", c.Statefulset.Spec.Template.Spec.Containers, statefulSet.Spec.Template.Spec.Containers, needsRollUpdate, reasons)
+	needsRollUpdate, reasons = c.compareContainers("statefulset initContainers", c.Statefulset.Spec.Template.Spec.InitContainers, statefulSet.Spec.Template.Spec.InitContainers, needsRollUpdate, reasons)
+	needsRollUpdate, reasons = c.compareContainers("statefulset containers", c.Statefulset.Spec.Template.Spec.Containers, statefulSet.Spec.Template.Spec.Containers, needsRollUpdate, reasons)
 
 	if len(c.Statefulset.Spec.Template.Spec.Containers) == 0 {
 		c.logger.Warningf("statefulset %q has no container", util.NameFromMeta(c.Statefulset.ObjectMeta))
@@ -560,30 +572,30 @@ func newCheck(msg string, cond containerCondition) containerCheck {
 
 func (c *Cluster) compareContainers(description string, setA, setB []v1.Container, needsRollUpdate bool, reasons []string) (bool, []string) {
 	if len(setA) != len(setB) {
-		return true, append(reasons, fmt.Sprintf("new statefulset %s's length does not match the current ones", description))
+		return true, append(reasons, fmt.Sprintf("new %s's length does not match the current ones", description))
 	}
 
 	checks := []containerCheck{
-		newCheck("new statefulset %s's %s (index %d) name does not match the current one",
+		newCheck("new %s's %s (index %d) name does not match the current one",
 			func(a, b v1.Container) bool { return a.Name != b.Name }),
-		newCheck("new statefulset %s's %s (index %d) readiness probe does not match the current one",
+		newCheck("new %s's %s (index %d) readiness probe does not match the current one",
 			func(a, b v1.Container) bool { return !reflect.DeepEqual(a.ReadinessProbe, b.ReadinessProbe) }),
-		newCheck("new statefulset %s's %s (index %d) ports do not match the current one",
+		newCheck("new %s's %s (index %d) ports do not match the current one",
 			func(a, b v1.Container) bool { return !comparePorts(a.Ports, b.Ports) }),
-		newCheck("new statefulset %s's %s (index %d) resources do not match the current ones",
+		newCheck("new %s's %s (index %d) resources do not match the current ones",
 			func(a, b v1.Container) bool { return !compareResources(&a.Resources, &b.Resources) }),
-		newCheck("new statefulset %s's %s (index %d) environment does not match the current one",
+		newCheck("new %s's %s (index %d) environment does not match the current one",
 			func(a, b v1.Container) bool { return !compareEnv(a.Env, b.Env) }),
-		newCheck("new statefulset %s's %s (index %d) environment sources do not match the current one",
+		newCheck("new %s's %s (index %d) environment sources do not match the current one",
 			func(a, b v1.Container) bool { return !reflect.DeepEqual(a.EnvFrom, b.EnvFrom) }),
-		newCheck("new statefulset %s's %s (index %d) security context does not match the current one",
+		newCheck("new %s's %s (index %d) security context does not match the current one",
 			func(a, b v1.Container) bool { return !reflect.DeepEqual(a.SecurityContext, b.SecurityContext) }),
-		newCheck("new statefulset %s's %s (index %d) volume mounts do not match the current one",
+		newCheck("new %s's %s (index %d) volume mounts do not match the current one",
 			func(a, b v1.Container) bool { return !reflect.DeepEqual(a.VolumeMounts, b.VolumeMounts) }),
 	}
 
 	if !c.OpConfig.EnableLazySpiloUpgrade {
-		checks = append(checks, newCheck("new statefulset %s's %s (index %d) image does not match the current one",
+		checks = append(checks, newCheck("new %s's %s (index %d) image does not match the current one",
 			func(a, b v1.Container) bool { return a.Image != b.Image }))
 	}
 
@@ -775,6 +787,47 @@ func (c *Cluster) compareServices(old, new *v1.Service) (bool, string) {
 	return true, ""
 }
 
+func (c *Cluster) compareLogicalBackupJob(cur, new *batchv1.CronJob) (match bool, reason string) {
+
+	if cur.Spec.Schedule != new.Spec.Schedule {
+		return false, fmt.Sprintf("new job's schedule %q does not match the current one %q",
+			new.Spec.Schedule, cur.Spec.Schedule)
+	}
+
+	newImage := new.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Image
+	curImage := cur.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Image
+	if newImage != curImage {
+		return false, fmt.Sprintf("new job's image %q does not match the current one %q",
+			newImage, curImage)
+	}
+
+	newPgVersion := getPgVersion(new)
+	curPgVersion := getPgVersion(cur)
+	if newPgVersion != curPgVersion {
+		return false, fmt.Sprintf("new job's env PG_VERSION %q does not match the current one %q",
+			newPgVersion, curPgVersion)
+	}
+
+	needsReplace := false
+	reasons := make([]string, 0)
+	needsReplace, reasons = c.compareContainers("cronjob container", cur.Spec.JobTemplate.Spec.Template.Spec.Containers, new.Spec.JobTemplate.Spec.Template.Spec.Containers, needsReplace, reasons)
+	if needsReplace {
+		return false, fmt.Sprintf("logical backup container specs do not match: %v", strings.Join(reasons, `', '`))
+	}
+
+	return true, ""
+}
+
+func getPgVersion(cronJob *batchv1.CronJob) string {
+	envs := cronJob.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Env
+	for _, env := range envs {
+		if env.Name == "PG_VERSION" {
+			return env.Value
+		}
+	}
+	return ""
+}
+
 // addFinalizer patches the postgresql CR to add finalizer
 func (c *Cluster) addFinalizer() error {
 	if c.hasFinalizer() {
@@ -790,6 +843,7 @@ func (c *Cluster) addFinalizer() error {
 
 	// update the spec, maintaining the new resourceVersion
 	c.setSpec(newSpec)
+
 	return nil
 }
 
@@ -838,10 +892,20 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 	c.setSpec(newSpec)
 
 	defer func() {
+		var (
+			pgUpdatedStatus *acidv1.Postgresql
+			err             error
+		)
 		if updateFailed {
-			c.KubeClient.SetPostgresCRDStatus(c.clusterName(), acidv1.ClusterStatusUpdateFailed)
+			pgUpdatedStatus, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), acidv1.ClusterStatusUpdateFailed)
 		} else {
-			c.KubeClient.SetPostgresCRDStatus(c.clusterName(), acidv1.ClusterStatusRunning)
+			pgUpdatedStatus, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), acidv1.ClusterStatusRunning)
+		}
+		if err != nil {
+			c.logger.Warningf("could not set cluster status: %v", err)
+		}
+		if pgUpdatedStatus != nil {
+			c.setSpec(pgUpdatedStatus)
 		}
 	}()
 
@@ -1163,7 +1227,7 @@ func (c *Cluster) ReceivePodEvent(event PodEvent) {
 	}
 }
 
-func (c *Cluster) processPodEvent(obj interface{}) error {
+func (c *Cluster) processPodEvent(obj interface{}, isInInitialList bool) error {
 	event, ok := obj.(PodEvent)
 	if !ok {
 		return fmt.Errorf("could not cast to PodEvent")

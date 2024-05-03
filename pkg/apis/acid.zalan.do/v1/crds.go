@@ -343,6 +343,9 @@ var PostgresCRDResourceValidation = apiextv1.CustomResourceValidation{
 							},
 						},
 					},
+					"logicalBackupRetention": {
+						Type: "string",
+					},
 					"logicalBackupSchedule": {
 						Type:    "string",
 						Pattern: "^(\\d+|\\*)(/\\d+)?(\\s+(\\d+|\\*)(/\\d+)?){4}$",
@@ -590,9 +593,6 @@ var PostgresCRDResourceValidation = apiextv1.CustomResourceValidation{
 								Type: "string",
 								Enum: []apiextv1.JSON{
 									{
-										Raw: []byte(`"10"`),
-									},
-									{
 										Raw: []byte(`"11"`),
 									},
 									{
@@ -606,6 +606,9 @@ var PostgresCRDResourceValidation = apiextv1.CustomResourceValidation{
 									},
 									{
 										Raw: []byte(`"15"`),
+									},
+									{
+										Raw: []byte(`"16"`),
 									},
 								},
 							},
@@ -996,6 +999,15 @@ var PostgresCRDResourceValidation = apiextv1.CustomResourceValidation{
 							},
 						},
 					},
+					"usersIgnoringSecretRotation": {
+						Type:     "array",
+						Nullable: true,
+						Items: &apiextv1.JSONSchemaPropsOrArray{
+							Schema: &apiextv1.JSONSchemaProps{
+								Type: "string",
+							},
+						},
+					},
 					"usersWithInPlaceSecretRotation": {
 						Type:     "array",
 						Nullable: true,
@@ -1309,6 +1321,9 @@ var OperatorConfigCRDResourceValidation = apiextv1.CustomResourceValidation{
 								Type: "boolean",
 							},
 							"enable_init_containers": {
+								Type: "boolean",
+							},
+							"enable_persistent_volume_claim_deletion": {
 								Type: "boolean",
 							},
 							"enable_pod_antiaffinity": {
@@ -1748,6 +1763,9 @@ var OperatorConfigCRDResourceValidation = apiextv1.CustomResourceValidation{
 								Type: "string",
 							},
 							"logical_backup_s3_bucket": {
+								Type: "string",
+							},
+							"logical_backup_s3_bucket_prefix": {
 								Type: "string",
 							},
 							"logical_backup_s3_endpoint": {
